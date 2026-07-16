@@ -35,6 +35,32 @@ struct Args {
 
     #[arg(long, default_value = "monospace")]
     font_family: String,
+
+    /// Text color as a hexadecimal RGB value, for example:
+    /// --color "#ffffff", --color "ffffff", or --color "ff0000"
+    #[arg(long, default_value = "#ffffff", value_parser = parse_color)]
+    color: Color,
+}
+
+fn parse_color(value: &str) -> Result<Color, String> {
+    let value = value.strip_prefix('#').unwrap_or(value);
+
+    if value.len() != 6 {
+        return Err(format!(
+            "invalid color '{value}': expected a 6-digit hexadecimal RGB value, such as #ffffff"
+        ));
+    }
+
+    let red = u8::from_str_radix(&value[0..2], 16)
+        .map_err(|_| format!("invalid color '{value}': invalid red component"))?;
+
+    let green = u8::from_str_radix(&value[2..4], 16)
+        .map_err(|_| format!("invalid color '{value}': invalid green component"))?;
+
+    let blue = u8::from_str_radix(&value[4..6], 16)
+        .map_err(|_| format!("invalid color '{value}': invalid blue component"))?;
+
+    Ok(Color::rgb(red, green, blue))
 }
 
 struct Surface {
@@ -58,110 +84,6 @@ struct App {
     font_family: String,
     font_system: FontSystem,
     cache: SwashCache,
-}
-
-fn ansi_color(index: u16) -> Color {
-    const COLORS: [(u8, u8, u8); 16] = [
-        (0, 0, 0),
-        (205, 0, 0),
-        (0, 205, 0),
-        (205, 205, 0),
-        (0, 0, 238),
-        (205, 0, 205),
-        (0, 205, 205),
-        (229, 229, 229),
-        (127, 127, 127),
-        (255, 0, 0),
-        (0, 255, 0),
-        (255, 255, 0),
-        (92, 92, 255),
-        (255, 0, 255),
-        (0, 255, 255),
-        (255, 255, 255),
-    ];
-
-    if index < 16 {
-        let (r, g, b) = COLORS[index as usize];
-        return Color::rgb(r, g, b);
-    }
-
-    if index < 232 {
-        let n = index - 16;
-        let levels = [0, 95, 135, 175, 215, 255];
-        return Color::rgb(
-            levels[(n / 36) as usize],
-            levels[((n / 6) % 6) as usize],
-            levels[(n % 6) as usize],
-        );
-    }
-
-    let value = (8 + (index - 232) * 10) as u8;
-    Color::rgb(value, value, value)
-}
-
-fn parse_ansi(input: &str) -> (String, Color) {
-    let bytes = input.as_bytes();
-    let mut text = String::new();
-    let mut color = None;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == 0x1b && bytes[i + 1] == b'[' {
-            let mut end = i + 2;
-
-            while end < bytes.len() && bytes[end] != b'm' {
-                end += 1;
-            }
-
-            if end == bytes.len() {
-                text.push_str(&input[i..]);
-                break;
-            }
-
-            let params: Vec<u16> = input[i + 2..end]
-                .split(';')
-                .filter_map(|value| value.parse().ok())
-                .collect();
-
-            let mut p = 0;
-
-            while p < params.len() {
-                match params[p] {
-                    30..=37 => color = Some(ansi_color(params[p] - 30)),
-                    90..=97 => color = Some(ansi_color(params[p] - 90 + 8)),
-                    38 if p + 2 < params.len() && params[p + 1] == 5 => {
-                        color = Some(ansi_color(params[p + 2]));
-                        p += 2;
-                    }
-                    38 if p + 4 < params.len() && params[p + 1] == 2 => {
-                        color = Some(Color::rgb(
-                            params[p + 2].min(255) as u8,
-                            params[p + 3].min(255) as u8,
-                            params[p + 4].min(255) as u8,
-                        ));
-                        p += 4;
-                    }
-                    _ => {}
-                }
-
-                p += 1;
-            }
-
-            i = end + 1;
-        } else {
-            let start = i;
-
-            while i < bytes.len()
-                && !(i + 1 < bytes.len() && bytes[i] == 0x1b && bytes[i + 1] == b'[')
-            {
-                i += 1;
-            }
-
-            text.push_str(&input[start..i]);
-        }
-    }
-
-    (text, color.unwrap_or_else(|| Color::rgb(255, 255, 255)))
 }
 
 impl App {
@@ -204,6 +126,7 @@ impl App {
 
         let stride = width * 4;
         let size = (stride * height) as usize;
+
         let (buffer, canvas) = self
             .pool
             .create_buffer(
@@ -221,6 +144,7 @@ impl App {
 
         {
             let mut borrowed = text_buffer.borrow_with(&mut self.font_system);
+
             borrowed.set_size(Some(width as f32), Some(height as f32));
             borrowed.set_wrap(Wrap::None);
             borrowed.set_text(
@@ -407,19 +331,27 @@ fn main() {
         }
 
         let mut input = String::new();
-        io::stdin().read_to_string(&mut input).unwrap();
+
+        io::stdin()
+            .read_to_string(&mut input)
+            .expect("failed to read text from stdin");
+
         input.trim_end_matches(['\n', '\r']).to_owned()
     });
 
-    let (message, color) = parse_ansi(&message);
     let connection = Connection::connect_to_env().expect("failed to connect to Wayland");
+
     let (globals, mut event_queue) =
         registry_queue_init(&connection).expect("failed to initialize Wayland registry");
+
     let qh = event_queue.handle();
 
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor is unavailable");
+
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell is unavailable");
+
     let shm = Shm::bind(&globals, &qh).expect("wl_shm is unavailable");
+
     let pool = SlotPool::new(1024 * 1024, &shm).expect("failed to create shared-memory pool");
 
     let mut app = App {
@@ -431,7 +363,7 @@ fn main() {
         pool,
         surfaces: Vec::new(),
         message,
-        color,
+        color: args.color,
         font_size: args.font_size,
         font_family: args.font_family,
         font_system: FontSystem::new(),
