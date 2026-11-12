@@ -17,13 +17,17 @@ use smithay_client_toolkit::{
 };
 use std::{
     io::{self, IsTerminal, Read},
+    os::fd::AsRawFd,
     process,
+    time::Instant,
 };
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{wl_output, wl_region, wl_shm, wl_surface},
 };
+
+mod bar;
 
 #[derive(Parser)]
 struct Args {
@@ -116,6 +120,12 @@ impl App {
         });
     }
 
+    fn redraw_all(&mut self) {
+        for index in 0..self.surfaces.len() {
+            self.draw(index);
+        }
+    }
+
     fn draw(&mut self, index: usize) {
         let width = self.surfaces[index].width;
         let height = self.surfaces[index].height;
@@ -199,6 +209,16 @@ impl App {
                     }
                 }
             },
+        );
+
+        bar::draw(
+            canvas,
+            width,
+            height,
+            stride,
+            &mut self.font_system,
+            &mut self.cache,
+            &self.font_family,
         );
 
         buffer
@@ -370,9 +390,55 @@ fn main() {
         cache: SwashCache::new(),
     };
 
+    let mut next_bar_update = Instant::now() + bar::duration_until_next_minute();
+
     loop {
         event_queue
-            .blocking_dispatch(&mut app)
+            .dispatch_pending(&mut app)
             .expect("Wayland connection failed");
+
+        let now = Instant::now();
+
+        if now >= next_bar_update {
+            app.redraw_all();
+            next_bar_update = Instant::now() + bar::duration_until_next_minute();
+        }
+
+        event_queue
+            .flush()
+            .expect("failed to flush Wayland connection");
+
+        let Some(read_guard) = event_queue.prepare_read() else {
+            continue;
+        };
+
+        let timeout = next_bar_update.saturating_duration_since(Instant::now());
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+
+        let mut poll_fd = libc::pollfd {
+            fd: read_guard.connection_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+
+        // SAFETY: poll_fd points to one valid pollfd for the duration of this call.
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+
+        if result < 0 {
+            let error = io::Error::last_os_error();
+
+            if error.kind() == io::ErrorKind::Interrupted {
+                drop(read_guard);
+                continue;
+            }
+
+            panic!("failed to poll Wayland connection: {error}");
+        }
+
+        if result > 0 && poll_fd.revents & libc::POLLIN != 0 {
+            read_guard.read().expect("failed to read Wayland events");
+        } else {
+            drop(read_guard);
+        }
     }
 }
