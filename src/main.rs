@@ -82,6 +82,7 @@ struct App {
     shm: Shm,
     pool: SlotPool,
     surfaces: Vec<Surface>,
+    spacer_surfaces: Vec<Surface>,
     message: String,
     color: Color,
     font_size: f32,
@@ -118,6 +119,72 @@ impl App {
             width: 0,
             height: 0,
         });
+    }
+
+    fn create_spacer_surface(&mut self, output: wl_output::WlOutput, qh: &QueueHandle<Self>) {
+        let wl_surface = self.compositor.create_surface(qh);
+
+        // An empty input region allows pointer events to pass through.
+        let region = self.compositor.wl_compositor().create_region(qh, ());
+        wl_surface.set_input_region(Some(&region));
+        region.destroy();
+
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            wl_surface,
+            Layer::Top,
+            Some("text-wallpaper-spacer"),
+            Some(&output),
+        );
+
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_size(0, 6);
+        layer.set_exclusive_zone(6);
+        layer.commit();
+
+        self.spacer_surfaces.push(Surface {
+            output,
+            layer,
+            width: 0,
+            height: 0,
+        });
+    }
+
+    fn draw_spacer(&mut self, index: usize) {
+        let width = self.spacer_surfaces[index].width;
+        let height = self.spacer_surfaces[index].height;
+
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let stride = width * 4;
+        let size = (stride * height) as usize;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(
+                width as i32,
+                height as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+            )
+            .expect("failed to create spacer buffer");
+
+        // ARGB8888 with every byte set to zero is fully transparent.
+        canvas[..size].fill(0);
+
+        buffer
+            .attach_to(self.spacer_surfaces[index].layer.wl_surface())
+            .expect("failed to attach spacer buffer");
+
+        self.spacer_surfaces[index]
+            .layer
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
+
+        self.spacer_surfaces[index].layer.commit();
     }
 
     fn redraw_all(&mut self) {
@@ -240,7 +307,8 @@ impl OutputHandler for App {
     }
 
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        self.create_surface(output, qh);
+        self.create_surface(output.clone(), qh);
+        self.create_spacer_surface(output, qh);
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -252,12 +320,18 @@ impl OutputHandler for App {
         output: wl_output::WlOutput,
     ) {
         self.surfaces.retain(|surface| surface.output != output);
+
+        self.spacer_surfaces
+            .retain(|surface| surface.output != output);
     }
 }
 
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
         self.surfaces.retain(|surface| surface.layer != *layer);
+
+        self.spacer_surfaces
+            .retain(|surface| surface.layer != *layer);
     }
 
     fn configure(
@@ -276,6 +350,17 @@ impl LayerShellHandler for App {
             self.surfaces[index].width = configure.new_size.0;
             self.surfaces[index].height = configure.new_size.1;
             self.draw(index);
+            return;
+        }
+
+        if let Some(index) = self
+            .spacer_surfaces
+            .iter()
+            .position(|surface| surface.layer == *layer)
+        {
+            self.spacer_surfaces[index].width = configure.new_size.0;
+            self.spacer_surfaces[index].height = configure.new_size.1;
+            self.draw_spacer(index);
         }
     }
 }
@@ -382,6 +467,7 @@ fn main() {
         shm,
         pool,
         surfaces: Vec::new(),
+        spacer_surfaces: Vec::new(),
         message,
         color: args.color,
         font_size: args.font_size,
